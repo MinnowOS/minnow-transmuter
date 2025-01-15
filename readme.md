@@ -1,14 +1,14 @@
-# Kelp Transmuter
+# Minnow Transmuter
 
-Transmuting code from WordPress into something new. This is not a functional tool, at least not yet. Keep an eye on [kelp.world](https://kelp.world).
+Transmuting code from WordPress into something new. This is not a functional tool, at least not yet. Keep an eye on [minn.xyz](https://minn.xyz).
 
 ## Docs
 
 Git clone repo
 
 ```
-git clone https://github.com/KelpWorld/kelp-transmuter
-cd kelp-transmuter/
+git clone https://github.com/MinnowApp/minn-transmuter
+cd minn-transmuter/
 ```
 
 Prepare a copy of WordPress

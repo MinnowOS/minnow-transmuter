@@ -40,7 +40,7 @@ class FunctionCollector extends NodeVisitorAbstract
             if (!isset($this->functionMappings[$functionName])) {
                 // Create default mapping
                 $this->functionMappings[$functionName] = [
-                    'namespace' => 'Kelp',
+                    'namespace' => 'Minnow',
                     'class' => 'Misc',
                     'method' => $functionName,
                 ];
@@ -106,7 +106,7 @@ class ClassCollector extends NodeVisitorAbstract
             if (!isset($this->classMappings[$className])) {
                 // Create default mapping
                 $this->classMappings[$className] = [
-                    'namespace' => 'Kelp',
+                    'namespace' => 'Minnow',
                     'class' => $className,
                 ];
             }
@@ -225,7 +225,7 @@ foreach ($phpFiles as $file) {
         $code = preg_replace('/\brequire(?:_once)?\s+ABSPATH\b/', '// $0', $code);
 
         // Perform various text replacements
-        $code = str_replace('WordPress', 'Kelp', $code);
+        $code = str_replace('WordPress', 'Minnow', $code);
         $code = str_replace('Howdy', 'Hey', $code);
         $code = str_replace('wp-login.php', 'admin/', $code);
         if (str_contains($filePath, 'load.php')) {
