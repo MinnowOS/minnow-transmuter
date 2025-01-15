@@ -226,6 +226,7 @@ foreach ($phpFiles as $file) {
 
         // Perform various text replacements
         $code = str_replace('WordPress', 'Minnow', $code);
+        $code = str_replace('https://wordpress.org', 'https://minn.xyz/legacy', $code);
         $code = str_replace('Howdy', 'Hey', $code);
         $code = str_replace('wp-login.php', 'admin/', $code);
         if (str_contains($filePath, 'load.php')) {
