@@ -182,6 +182,7 @@ $phpFiles = new RegexIterator($iterator, '/\.php$/i');
 // Define an array of files to exclude
 $excludeFiles = [
     'noop.php',
+    'wp-admin/install-helper.php',
     'wp-includes/sodium_compat',
     'wp-includes/ID3',
     'wp-includes/Requests',
