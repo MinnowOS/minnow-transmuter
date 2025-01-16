@@ -7,8 +7,8 @@ Transmuting code from WordPress into something new. This is not a functional too
 Git clone repo
 
 ```
-git clone https://github.com/MinnowApp/minn-transmuter
-cd minn-transmuter/
+git clone https://github.com/MinnowOS/minnow-transmuter
+cd minnow-transmuter/
 ```
 
 Prepare a copy of WordPress
