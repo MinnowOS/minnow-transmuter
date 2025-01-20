@@ -338,6 +338,29 @@ $existingOutdatedClassMappings = $outdatedMappings['classes'] ?? [];
 $outdatedFunctionMappings = array_merge($existingOutdatedFunctionMappings, $outdatedFunctionMappings);
 $outdatedClassMappings = array_merge($existingOutdatedClassMappings, $outdatedClassMappings);
 
+// Purge output directory
+$outputDir = __DIR__ . '/build';
+if (is_dir($outputDir)) {
+    foreach (scandir($outputDir) as $item) {
+        if ($item !== '.' && $item !== '..') {
+            $path = $outputDir . DIRECTORY_SEPARATOR . $item;
+
+            if (is_dir($path)) {
+                foreach (new RecursiveIteratorIterator(
+                    new RecursiveDirectoryIterator($path, RecursiveDirectoryIterator::SKIP_DOTS),
+                    RecursiveIteratorIterator::CHILD_FIRST
+                ) as $subItem) {
+                    $subItem->isDir() ? rmdir($subItem->getPathname()) : unlink($subItem->getPathname());
+                }
+                rmdir($path); // Remove the now-empty directory
+            } else {
+                unlink($path); // Remove the file
+            }
+        }
+    }
+    echo "Successfully purged the directory: $outputDir\n";
+}
+
 // Generate code for each class using the accumulated class methods
 foreach ($classMethods as $namespace => $classes) {
     foreach ($classes as $className => $methods) {
