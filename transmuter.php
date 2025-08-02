@@ -15,18 +15,24 @@ class FunctionCollector extends NodeVisitorAbstract
     public $classMethods = [];
     public $functions = [];
     public $functionMappings;
+    public $polyfills = [];
     private $currentFile;
-
-    public function __construct($currentFile, $functionMappings)
+    public function __construct($currentFile, $functionMappings, $polyfills)
     {
         $this->currentFile = $currentFile;
         $this->functionMappings = $functionMappings;
+        $this->polyfills = $polyfills;
     }
 
     public function enterNode(Node $node)
     {
         if ($node instanceof Node\Stmt\Function_) {
             $functionName = $node->name->toString();
+
+            if (in_array($functionName, $this->polyfills)) {
+                return; // Skip polyfill functions
+            }
+
             // Avoid collecting duplicate functions
             if (!isset($this->functions[$functionName])) {
                 // Store the function node along with its file path
@@ -47,8 +53,8 @@ class FunctionCollector extends NodeVisitorAbstract
             }
 
             $mapping = $this->functionMappings[$functionName];
-
-            // Transform function to method
+            
+            // Create the method node once, as it's the same for both cases
             $methodNode = new Node\Stmt\ClassMethod(
                 $mapping['method'],
                 [
@@ -159,10 +165,15 @@ if ( empty( $mappings ) ) {
 }
 $functionMappings = $mappings['functions'] ?? [];
 $classMappings = $mappings['classes'] ?? [];
-
+$polyfills = [];
+foreach ($functionMappings as $functionName => $mapping) {
+    if ($mapping === 'polyfill') {
+        $polyfills[] = $functionName;
+    }
+}
+$polyfillCode = "<?php\n\n// Polyfills extracted by Minnow Transmuter\n\n";
 // Generate PHP code for the bindings.php file using string interpolation
 $bindingsCode = "<?php\n\n";
-
 // Initialize parser and traverser
 $parser = (new ParserFactory)->createForVersion(PhpVersion::fromString('7.4'));
 $prettyPrinter = new PrettyPrinter\Standard();
@@ -235,13 +246,40 @@ foreach ($phpFiles as $file) {
         }
 
         $stmts = $parser->parse($code);
+        if ($stmts) {
+            $nonPolyfillStmts = [];
+            foreach ($stmts as $stmt) {
+                $isPolyfillBlock = false;
+                if ($stmt instanceof Node\Stmt\If_) {
+                    $condition = $stmt->cond;
+                    if ($condition instanceof Node\Expr\BooleanNot &&
+                        $condition->expr instanceof Node\Expr\FuncCall &&
+                        $condition->expr->name instanceof Node\Name &&
+                        $condition->expr->name->toString() === 'function_exists' &&
+                        !empty($condition->expr->getArgs())
+                    ) {
+                        $arg = $condition->expr->getArgs()[0]->value;
+                        if ($arg instanceof Node\Scalar\String_ && in_array($arg->value, $polyfills)) {
+                            // This is a polyfill if block, extract it
+                            $polyfillCode .= $prettyPrinter->prettyPrint([$stmt]) . "\n\n";
+                            $isPolyfillBlock = true;
+                        }
+                    }
+                }
 
+                if (!$isPolyfillBlock) {
+                    $nonPolyfillStmts[] = $stmt;
+                }
+            }
+            // Use only the non-polyfill statements for transmutation
+            $stmts = $nonPolyfillStmts;
+        }
         if ($stmts === null) {
             continue;
         }
 
         $traverser = new NodeTraverser();
-        $functionCollector = new FunctionCollector($filePath, $functionMappings);
+        $functionCollector = new FunctionCollector($filePath, $functionMappings, $polyfills);
         $traverser->addVisitor(new PhpParser\NodeVisitor\NameResolver());
         $traverser->addVisitor($functionCollector);
         $traverser->traverse($stmts);
@@ -306,10 +344,10 @@ $outdatedClassMappings = [];
 
 // Identify and remove outdated function mappings
 foreach ($functionMappings as $functionName => $mapping) {
-    if (!isset($functionNames[$functionName])) {
-        // Function is not found in the codebase, so it's outdated
+    // ADD a check to see if the function is a polyfill
+    if (!isset($functionNames[$functionName]) && !in_array($functionName, $polyfills)) {
+        // Function is not found AND it's not a polyfill, so it's outdated
         unset($functionMappings[$functionName]);
-
         // Add to outdated functions with removal date
         $mapping['removed'] = $currentDate;
         $outdatedFunctionMappings[$functionName] = $mapping;
@@ -403,7 +441,7 @@ foreach ($namespacedClasses as $namespace => $classes) {
 
         // Retrieve namespace subdirectory
         $parts = explode('\\', $namespace);
-        
+
         // Check if there's more than one part (i.e., there is a subfolder)
         if (count($parts) > 1) {
             array_shift( $parts );
@@ -426,8 +464,11 @@ foreach ($namespacedClasses as $namespace => $classes) {
     }
 }
 
-// Sort function mappings by namespace, class, and method
-uasort($functionMappings, function ($a, $b) {
+// Separate polyfills from sortable mappings
+$sortableMappings = array_filter($functionMappings, 'is_array');
+$polyfillMappings = array_filter($functionMappings, function($value) {
+    return !is_array($value);
+});
     // Compare namespaces
     $namespaceComparison = strcmp($a['namespace'], $b['namespace']);
     if ($namespaceComparison !== 0) {
@@ -444,6 +485,8 @@ uasort($functionMappings, function ($a, $b) {
     return strcmp($a['method'], $b['method']);
 });
 
+// Combine the sorted mappings with the polyfills
+$functionMappings = $sortableMappings + $polyfillMappings;
 // Write updated function mappings back to mappings.yaml
 $combinedMappings = [
     'functions' => $functionMappings,
@@ -462,6 +505,11 @@ $builtInFunctions = get_defined_functions()['internal'];
 $builtInFunctions = array_map('strtolower', $builtInFunctions); // Normalize to lowercase
 
 foreach ($functionMappings as $functionName => $mapping) {
+    // Add this check to skip polyfills
+    if (!is_array($mapping)) {
+        continue;
+    }
+    
     $namespace = $mapping['namespace'];
     $class = $mapping['class'];
     $method = $mapping['method'];
@@ -485,7 +533,6 @@ foreach ($classMappings as $originalClassName => $mapping) {
     $class = $mapping['class'];
 
     $newClassFullName = "{$namespace}\\{$class}";
-
     $bindingsCode .= "class_alias('{$newClassFullName}', '{$originalClassName}');\n";
 }
 
@@ -495,3 +542,7 @@ echo "Generating $bindingsFile\n";
 
 // Save the generated bindings code to the file
 file_put_contents($bindingsFile, $bindingsCode);
+
+$polyfillsFile = __DIR__ . '/build/polyfills.php';
+echo "Generating $polyfillsFile\n";
+file_put_contents($polyfillsFile, $polyfillCode);
