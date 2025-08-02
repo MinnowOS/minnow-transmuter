@@ -26,7 +26,7 @@ Run `php transmuter.php` which will generate a `build` directory. This process i
 php -ini | grep "php.ini"
 ```
 
-Edit the found configuration file. Will look something like `/opt/homebrew/etc/php/8.2/php.ini`. Find the line `memory_limit` and change to the following.
+Edit the found configuration file. Will look something like `/opt/homebrew/etc/php/8.3/php.ini`. Find the line `memory_limit` and change to the following.
 ```
 memory_limit = 8G
 ```
