@@ -15,6 +15,7 @@ class FunctionCollector extends NodeVisitorAbstract
     public $classMethods = [];
     public $functions = [];
     public $functionMappings;
+    public $globalClassMethods = [];
     public $polyfills = [];
     private $currentFile;
     public function __construct($currentFile, $functionMappings, $polyfills)
@@ -66,18 +67,27 @@ class FunctionCollector extends NodeVisitorAbstract
                 ]
             );
 
-            // Organize method under class and namespace
-            $nsKey = $mapping['namespace'];
-            $classKey = $mapping['class'];
+            // NEW: Check if this should be a global class method (no 'class' key)
+            if (isset($mapping['namespace']) && !isset($mapping['class'])) {
+                $className = $mapping['namespace'];
+                if (!isset($this->globalClassMethods[$className])) {
+                    $this->globalClassMethods[$className] = [];
+                }
+                $this->globalClassMethods[$className][] = $methodNode;
+            } else {
+                // EXISTING: Organize method under class and namespace
+                $nsKey = $mapping['namespace'];
+                $classKey = $mapping['class'];
 
-            if (!isset($this->classMethods[$nsKey])) {
-                $this->classMethods[$nsKey] = [];
-            }
-            if (!isset($this->classMethods[$nsKey][$classKey])) {
-                $this->classMethods[$nsKey][$classKey] = [];
-            }
+                if (!isset($this->classMethods[$nsKey])) {
+                    $this->classMethods[$nsKey] = [];
+                }
+                if (!isset($this->classMethods[$nsKey][$classKey])) {
+                    $this->classMethods[$nsKey][$classKey] = [];
+                }
 
-            $this->classMethods[$nsKey][$classKey][] = $methodNode;
+                $this->classMethods[$nsKey][$classKey][] = $methodNode;
+            }
         }
     }
 }
@@ -118,18 +128,14 @@ class ClassCollector extends NodeVisitorAbstract
             }
 
             $mapping = $this->classMappings[$className];
-
             // Update class name
             $node->name = new Node\Identifier($mapping['class']);
-
             // **Update extended class name if needed**
             if ($node->extends !== null) {
                 $extendedClassName = $node->extends->toString();
-
                 // Check if extended class is in the mappings
                 if (isset($this->classMappings[$extendedClassName])) {
                     $extendedClassMapping = $this->classMappings[$extendedClassName];
-
                     // Build fully qualified name for the new extended class
                     $newExtendedClassName = $extendedClassMapping['namespace'] . '\\' . $extendedClassMapping['class'];
 
@@ -140,7 +146,6 @@ class ClassCollector extends NodeVisitorAbstract
 
             // Organize class under namespace
             $nsKey = $mapping['namespace'];
-
             if (!isset($this->namespacedClasses[$nsKey])) {
                 $this->namespacedClasses[$nsKey] = [];
             }
@@ -152,7 +157,6 @@ class ClassCollector extends NodeVisitorAbstract
 // Directory containing PHP files
 $directory = 'wordpress';
 $mappings = [];
-
 // Read both function and class mappings
 if ( file_exists('mappings.yaml')) {
     $mappings = Yaml::parseFile('mappings.yaml');
@@ -181,10 +185,10 @@ $prettyPrinter = new PrettyPrinter\Standard();
 $allFunctions = [];
 $functionNames = [];
 $classMethods = [];
+$allGlobalClassMethods = []; // Accumulator for new global class methods
 $allClasses = [];
 $classNames = [];
 $namespacedClasses = [];
-
 // Collect all PHP files in the directory recursively
 $directoryIterator = new RecursiveDirectoryIterator($directory);
 $iterator = new RecursiveIteratorIterator($directoryIterator);
@@ -205,7 +209,6 @@ $excludeFiles = [
     'wp-includes/cache-compat.php',
     'wp-content/',
 ];
-
 foreach ($phpFiles as $file) {
     $filePath = $file->getRealPath();
 
@@ -224,7 +227,6 @@ foreach ($phpFiles as $file) {
 
     try {
         $code = file_get_contents($filePath);
-
         // remove code from class-wp-filesystem-ftpsockets.php
         if (str_contains($filePath, 'class-wp-filesystem-ftpsockets.php')) {
             $code = str_replace("		// Check if possible to use ftp functions.\n		if ( ! require_once ABSPATH . 'wp-admin/includes/class-ftp.php' ) {\n			return;\n		}", "", $code);
@@ -235,7 +237,6 @@ foreach ($phpFiles as $file) {
         }   
         // Perform the replacement for "require ABSPATH" with "// require ABSPATH"
         $code = preg_replace('/\brequire(?:_once)?\s+ABSPATH\b/', '// $0', $code);
-
         // Perform various text replacements
         $code = str_replace('WordPress', 'Minnow', $code);
         $code = str_replace('https://wordpress.org', 'https://minn.xyz/legacy', $code);
@@ -289,7 +290,6 @@ foreach ($phpFiles as $file) {
         $classTraverser->addVisitor(new PhpParser\NodeVisitor\NameResolver());
         $classTraverser->addVisitor($classCollector);
         $classTraverser->traverse($stmts);
-
         foreach ($functionCollector->functions as $functionName => $data) {
             if (!isset($functionNames[$functionName])) {
                 $allFunctions[$functionName] = $data['node'];
@@ -301,6 +301,7 @@ foreach ($phpFiles as $file) {
         }
         // Accumulate class methods
         foreach ($functionCollector->classMethods as $nsKey => $classes) {
+ 
             if (!isset($classMethods[$nsKey])) {
                 $classMethods[$nsKey] = [];
             }
@@ -310,6 +311,13 @@ foreach ($phpFiles as $file) {
                 }
                 $classMethods[$nsKey][$classKey] = array_merge($classMethods[$nsKey][$classKey], $methods);
             }
+        }
+        // NEW: Accumulate global class methods
+        foreach ($functionCollector->globalClassMethods as $className => $methods) {
+            if (!isset($allGlobalClassMethods[$className])) {
+                $allGlobalClassMethods[$className] = [];
+            }
+            $allGlobalClassMethods[$className] = array_merge($allGlobalClassMethods[$className], $methods);
         }
          // Accumulate classes
         foreach ($classCollector->classes as $className => $data) {
@@ -464,19 +472,78 @@ foreach ($namespacedClasses as $namespace => $classes) {
     }
 }
 
+// Generate code for each global class
+foreach ($allGlobalClassMethods as $className => $methods) {
+    // Manually add the new get() method to the Minnow class
+    if ($className === 'Minnow') {
+        // Build the AST for the new method
+        $getMethod = new Node\Stmt\ClassMethod('get', [
+            'flags' => Node\Stmt\Class_::MODIFIER_PUBLIC | Node\Stmt\Class_::MODIFIER_STATIC,
+            'params' => [new Node\Param(new Node\Expr\Variable('name'), null, new Node\Identifier('string'))],
+            'stmts' => [
+                new Node\Stmt\If_(
+                    new Node\Expr\Isset_([
+                        new Node\Expr\ArrayDimFetch(
+                            new Node\Expr\Variable('GLOBALS', ['name' => 'GLOBALS']),
+                            new Node\Expr\Variable('name')
+                        )
+                    ]),
+                    [
+                        'stmts' => [
+                            new Node\Stmt\Return_(
+                                new Node\Expr\ArrayDimFetch(
+                                    new Node\Expr\Variable('GLOBALS', ['name' => 'GLOBALS']),
+                                    new Node\Expr\Variable('name')
+                                )
+                            )
+                        ]
+                    ]
+                )
+            ]
+        ]);
+        // Add the new method to the beginning of the methods array
+        array_unshift($methods, $getMethod);
+    }
+
+    $classNode = new Node\Stmt\Class_($className, [
+        'stmts' => $methods,
+    ]);
+
+    // This class is not in a namespace
+    $code = $prettyPrinter->prettyPrintFile([$classNode]);
+
+    // Determine the output file path
+    $outputDir = __DIR__ . '/build';
+    if (!is_dir($outputDir . '/app')) {
+        mkdir($outputDir . '/app', 0777, true);
+    }
+    $outputFile = $outputDir . '/app/' . $className . '.php';
+    echo "Generating global class $outputFile\n";
+
+    // Save the generated code to the file
+    file_put_contents($outputFile, $code);
+}
+
 // Separate polyfills from sortable mappings
 $sortableMappings = array_filter($functionMappings, 'is_array');
 $polyfillMappings = array_filter($functionMappings, function($value) {
     return !is_array($value);
 });
+
+// Sort only the array-based mappings
+uasort($sortableMappings, function ($a, $b) {
     // Compare namespaces
     $namespaceComparison = strcmp($a['namespace'], $b['namespace']);
     if ($namespaceComparison !== 0) {
         return $namespaceComparison;
     }
+    
+    // Use isset to handle global classes that don't have a 'class' key
+    $aClass = $a['class'] ?? '';
+    $bClass = $b['class'] ?? '';
 
     // Namespaces are equal, compare classes
-    $classComparison = strcmp($a['class'], $b['class']);
+    $classComparison = strcmp($aClass, $bClass);
     if ($classComparison !== 0) {
         return $classComparison;
     }
@@ -511,20 +578,31 @@ foreach ($functionMappings as $functionName => $mapping) {
     }
     
     $namespace = $mapping['namespace'];
-    $class = $mapping['class'];
+    $class = $mapping['class'] ?? null; // Null for global classes
     $method = $mapping['method'];
     // Check if the function is a built-in function
     if (in_array(strtolower($functionName), $builtInFunctions)) {
         // Skip built-in functions
         continue;
     }
-
-    $bindingsCode .= <<<EOD
+    
+    if ($class) {
+        // Existing logic for namespaced classes
+        $bindingsCode .= <<<EOD
 function {$functionName}(...\$args) {
     return {$namespace}\\{$class}::{$method}(...\$args);
 }
 
 EOD;
+    } else {
+        // New logic for global classes
+        $bindingsCode .= <<<EOD
+function {$functionName}(...\$args) {
+    return {$namespace}::{$method}(...\$args);
+}
+
+EOD;
+    }
     $bindingsCode .= "\n";
 }
 
