@@ -9,7 +9,6 @@ use PhpParser\ParserFactory;
 use PhpParser\PhpVersion;
 use PhpParser\PrettyPrinter;
 use Symfony\Component\Yaml\Yaml;
-
 class FunctionCollector extends NodeVisitorAbstract
 {
     public $classMethods = [];
@@ -29,9 +28,9 @@ class FunctionCollector extends NodeVisitorAbstract
     {
         if ($node instanceof Node\Stmt\Function_) {
             $functionName = $node->name->toString();
-
             if (in_array($functionName, $this->polyfills)) {
-                return; // Skip polyfill functions
+                return;
+                // Skip polyfill functions
             }
 
             // Avoid collecting duplicate functions
@@ -54,7 +53,6 @@ class FunctionCollector extends NodeVisitorAbstract
             }
 
             $mapping = $this->functionMappings[$functionName];
-            
             // Create the method node once, as it's the same for both cases
             $methodNode = new Node\Stmt\ClassMethod(
                 $mapping['method'],
@@ -66,7 +64,6 @@ class FunctionCollector extends NodeVisitorAbstract
                     'attrGroups' => $node->attrGroups,
                 ]
             );
-
             // NEW: Check if this should be a global class method (no 'class' key)
             if (isset($mapping['namespace']) && !isset($mapping['class'])) {
                 $className = $mapping['namespace'];
@@ -137,7 +134,8 @@ class ClassCollector extends NodeVisitorAbstract
                 if (isset($this->classMappings[$extendedClassName])) {
                     $extendedClassMapping = $this->classMappings[$extendedClassName];
                     // Build fully qualified name for the new extended class
-                    $newExtendedClassName = $extendedClassMapping['namespace'] . '\\' . $extendedClassMapping['class'];
+                    $newExtendedClassName = $extendedClassMapping['namespace'] .
+'\\' . $extendedClassMapping['class'];
 
                     // Update the node
                     $node->extends = new Node\Name\FullyQualified($newExtendedClassName);
@@ -153,6 +151,36 @@ class ClassCollector extends NodeVisitorAbstract
         }
     }
 }
+
+/**
+ * A NodeVisitor to traverse the Abstract Syntax Tree (AST) and collect all method names for each class.
+ */
+class ClassMethodCollector extends NodeVisitorAbstract
+{
+    public $classMethods = [];
+    public function enterNode(Node $node)
+    {
+        if ($node instanceof Node\Stmt\Class_) {
+            $className = $node->name ? $node->name->toString() : '[anonymous]';
+            if ('[anonymous]' === $className) {
+                return;
+            }
+
+            if (!isset($this->classMethods[$className])) {
+                $this->classMethods[$className] = [];
+            }
+
+            foreach ($node->stmts as $stmt) {
+                if ($stmt instanceof Node\Stmt\ClassMethod) {
+                    $this->classMethods[$className][] = $stmt->name->toString();
+                }
+            }
+            $this->classMethods[$className] = array_unique($this->classMethods[$className]);
+            sort($this->classMethods[$className]);
+        }
+    }
+}
+
 
 // Directory containing PHP files
 $directory = 'wordpress';
@@ -209,6 +237,44 @@ $excludeFiles = [
     'wp-includes/cache-compat.php',
     'wp-content/',
 ];
+
+// --- Preliminary pass to collect all original class methods ---
+echo "Running preliminary scan for class methods...\n";
+$preliminaryParser = (new ParserFactory)->createForVersion(PhpVersion::fromString('7.4'));
+$preliminaryTraverser = new NodeTraverser();
+$methodCollector = new ClassMethodCollector();
+$preliminaryTraverser->addVisitor($methodCollector);
+
+// Re-iterate over the same files just for this purpose
+$directoryIteratorPrelim = new RecursiveDirectoryIterator($directory);
+$iteratorPrelim = new RecursiveIteratorIterator($directoryIteratorPrelim);
+$phpFilesPrelim = new RegexIterator($iteratorPrelim, '/\.php$/i');
+
+foreach ($phpFilesPrelim as $file) {
+    $filePath = $file->getRealPath();
+    $excluded = false;
+    foreach ($excludeFiles as $excludeFile) {
+        if (strpos($filePath, $excludeFile) !== false) {
+            $excluded = true;
+            continue;
+        }
+    }
+    if ($excluded) {
+        continue;
+    }
+    try {
+        $code = file_get_contents($filePath);
+        $stmts = $preliminaryParser->parse($code);
+        if ($stmts) {
+            $preliminaryTraverser->traverse($stmts);
+        }
+    } catch (Error $e) {
+        // Silently ignore parse errors in this preliminary pass
+    }
+}
+$originalClassMethods = $methodCollector->classMethods;
+echo "Preliminary scan complete.\n\n";
+
 foreach ($phpFiles as $file) {
     $filePath = $file->getRealPath();
 
@@ -256,8 +322,7 @@ foreach ($phpFiles as $file) {
                     if ($condition instanceof Node\Expr\BooleanNot &&
                         $condition->expr instanceof Node\Expr\FuncCall &&
                         $condition->expr->name instanceof Node\Name &&
-                        $condition->expr->name->toString() === 'function_exists' &&
-                        !empty($condition->expr->getArgs())
+                        $condition->expr->name->toString() === 'function_exists' && !empty($condition->expr->getArgs())
                     ) {
                         $arg = $condition->expr->getArgs()[0]->value;
                         if ($arg instanceof Node\Scalar\String_ && in_array($arg->value, $polyfills)) {
@@ -301,7 +366,6 @@ foreach ($phpFiles as $file) {
         }
         // Accumulate class methods
         foreach ($functionCollector->classMethods as $nsKey => $classes) {
- 
             if (!isset($classMethods[$nsKey])) {
                 $classMethods[$nsKey] = [];
             }
@@ -343,13 +407,123 @@ foreach ($phpFiles as $file) {
     }
 }
 
+// --- CONFLICT DETECTION LOGIC ---
+echo "Checking for mapping conflicts...\n";
+// 1. Build a set of all Fully Qualified Class Names (FQCNs) generated from functions.
+$functionGeneratedFqcns = [];
+foreach ($classMethods as $namespace => $classes) {
+    foreach (array_keys($classes) as $className) {
+        $fqcn = str_replace('/', '\\', $namespace) . '\\' . $className;
+        $functionGeneratedFqcns[$fqcn] = true; // Use as a set for fast lookups
+    }
+}
+
+// 2. Create a reverse map for renamed classes to easily find the original name.
+$renamedClassReverseMap = [];
+foreach ($classMappings as $originalClassName => $mapping) {
+    if (isset($mapping['namespace']) && isset($mapping['class'])) {
+        $fqcn = str_replace('/', '\\', $mapping['namespace']) . '\\' . $mapping['class'];
+        // Ensure we don't overwrite with outdated mapping info
+        if (isset($allClasses[$originalClassName])) {
+             $renamedClassReverseMap[$fqcn] = $originalClassName;
+        }
+    }
+}
+
+// 3. Iterate through renamed classes and check if they exist in the function-generated set.
+$conflictsFound = false;
+foreach ($renamedClassReverseMap as $fqcn => $originalClassName) {
+    if (isset($functionGeneratedFqcns[$fqcn])) {
+        echo "----------------------------------------------------------------\n";
+        echo "FATAL MAPPING CONFLICT DETECTED:\n\n";
+        echo "The class '{$originalClassName}' is mapped to '{$fqcn}', but this name is also\n";
+        echo "being used by a class generated from one or more functions.\n\n";
+        echo "This will cause methods to be overwritten or a fatal error.\n";
+        echo "To fix, please rename the class in the 'classes' section of mappings.yaml\n";
+        echo "or remap the conflicting functions to a different class.\n";
+        echo "----------------------------------------------------------------\n\n";
+        $conflictsFound = true;
+    }
+}
+
+// --- CONFLICT DETECTION LOGIC (CLASS & METHOD) ---
+echo "Checking for method mapping conflicts...\n";
+$methodConflictMap = [];
+
+// 1. Populate from function mappings
+foreach ($functionMappings as $functionName => $mapping) {
+    if (is_array($mapping)) { // Skip polyfills
+        $namespace = str_replace('/', '\\', $mapping['namespace']);
+        $methodName = $mapping['method'];
+        
+        $fqcn = isset($mapping['class']) ? $namespace . '\\' . $mapping['class'] : $namespace;
+
+        $key = "{$fqcn}::{$methodName}";
+        $source = "function {$functionName}()";
+        if (!isset($methodConflictMap[$key])) {
+            $methodConflictMap[$key] = [];
+        }
+        $methodConflictMap[$key][] = $source;
+    }
+}
+
+// 2. Populate from class mappings
+foreach ($classMappings as $originalClassName => $mapping) {
+    if (isset($originalClassMethods[$originalClassName])) {
+        $namespace = str_replace('/', '\\', $mapping['namespace']);
+        $className = $mapping['class'];
+        $fqcn = $namespace . '\\' . $className;
+
+        foreach ($originalClassMethods[$originalClassName] as $methodName) {
+            $key = "{$fqcn}::{$methodName}";
+            $source = "class {$originalClassName}::{$methodName}()";
+            if (!isset($methodConflictMap[$key])) {
+                $methodConflictMap[$key] = [];
+            }
+            $methodConflictMap[$key][] = $source;
+        }
+    }
+}
+
+// 3. Check for and report conflicts
+$methodConflictsFound = false;
+foreach ($methodConflictMap as $key => $sources) {
+    if (count($sources) > 1) {
+        if (!$methodConflictsFound) { // Print header only on first conflict
+            echo "----------------------------------------------------------------\n";
+            echo "FATAL METHOD MAPPING CONFLICT DETECTED:\n\n";
+            $methodConflictsFound = true;
+            $conflictsFound = true; // Use existing flag to halt script
+        }
+        echo "The method '{$key}' is generated by multiple sources:\n";
+        foreach ($sources as $source) {
+            echo "  - {$source}\n";
+        }
+        echo "\n";
+    }
+}
+
+if ($methodConflictsFound) {
+    echo "This will cause methods to be overwritten or a fatal error.\n";
+    echo "To fix, please remap the conflicting functions or class methods\n";
+    echo "in your mappings.yaml to have unique class and method names.\n";
+    echo "----------------------------------------------------------------\n\n";
+}
+
+
+if ($conflictsFound) {
+    die("Script halted due to critical mapping conflicts.\n");
+}
+
+echo "No mapping conflicts found.\n\n";
+// --- END CONFLICT DETECTION LOGIC ---
+
 // Get the current date
 $currentDate = date('M jS Y'); // e.g., "Oct 4th 2024"
 
 // Initialize arrays to hold outdated mappings
 $outdatedFunctionMappings = [];
 $outdatedClassMappings = [];
-
 // Identify and remove outdated function mappings
 foreach ($functionMappings as $functionName => $mapping) {
     // ADD a check to see if the function is a polyfill
@@ -367,7 +541,6 @@ foreach ($classMappings as $className => $mapping) {
     if (!isset($classNames[$className])) {
         // Class is not found in the codebase, so it's outdated
         unset($classMappings[$className]);
-
         // Add to outdated classes with removal date
         $mapping['removed'] = $currentDate;
         $outdatedClassMappings[$className] = $mapping;
@@ -379,11 +552,9 @@ $outdatedMappings = $mappings['outdated'] ?? ['functions' => [], 'classes' => []
 
 $existingOutdatedFunctionMappings = $outdatedMappings['functions'] ?? [];
 $existingOutdatedClassMappings = $outdatedMappings['classes'] ?? [];
-
 // Merge existing and new outdated mappings
 $outdatedFunctionMappings = array_merge($existingOutdatedFunctionMappings, $outdatedFunctionMappings);
 $outdatedClassMappings = array_merge($existingOutdatedClassMappings, $outdatedClassMappings);
-
 // Purge output directory
 $outputDir = __DIR__ . '/build';
 if (is_dir($outputDir)) {
@@ -396,6 +567,7 @@ if (is_dir($outputDir)) {
                     new RecursiveDirectoryIterator($path, RecursiveDirectoryIterator::SKIP_DOTS),
                     RecursiveIteratorIterator::CHILD_FIRST
                 ) as $subItem) {
+                
                     $subItem->isDir() ? rmdir($subItem->getPathname()) : unlink($subItem->getPathname());
                 }
                 rmdir($path); // Remove the now-empty directory
@@ -413,24 +585,22 @@ foreach ($classMethods as $namespace => $classes) {
         $classNode = new Node\Stmt\Class_($className, [
             'stmts' => $methods,
         ]);
-
+        $namespace = str_replace('/', '\\', $namespace);
         $namespaceNode = new Node\Stmt\Namespace_(new Node\Name($namespace), [
             $classNode,
         ]);
-
         $code = $prettyPrinter->prettyPrintFile([$namespaceNode]);
 
-        // Determine the output file path
-        $outputDir = __DIR__ . '/build';
-        if (!is_dir($outputDir)) {
-            mkdir($outputDir, 0777, true);
+        $parts = explode('\\', $namespace);
+        array_shift($parts); // Remove "Minnow"
+        $subDir = implode(DIRECTORY_SEPARATOR, $parts);
+        $finalDir = $outputDir . DIRECTORY_SEPARATOR . 'app' . (empty($subDir) ? '' : DIRECTORY_SEPARATOR . $subDir);
+        if (!is_dir($finalDir)) {
+            mkdir($finalDir, 0777, true);
         }
-        if (!is_dir($outputDir . '/app')) {
-            mkdir($outputDir . '/app', 0777, true);
-        }
-        $outputFile = $outputDir . '/app/' . $className . '.php';
-        echo "Generating $outputFile\n";
 
+        $outputFile = $finalDir . DIRECTORY_SEPARATOR . $className . '.php';
+        echo "Generating $outputFile\n";
         // Save the generated code to the file
         file_put_contents($outputFile, $code);
     }
@@ -439,38 +609,27 @@ foreach ($classMethods as $namespace => $classes) {
 foreach ($namespacedClasses as $namespace => $classes) {
     foreach ($classes as $classNode) {
         $className = $classNode->name->toString();
-
+        $namespace = str_replace('/', '\\', $namespace);
         $namespaceNode = new Node\Stmt\Namespace_(new Node\Name($namespace), [
             $classNode,
         ]);
-
         $code = $prettyPrinter->prettyPrintFile([$namespaceNode]);
-        $directory = "";
-
-        // Retrieve namespace subdirectory
+        
         $parts = explode('\\', $namespace);
-
-        // Check if there's more than one part (i.e., there is a subfolder)
-        if (count($parts) > 1) {
-            array_shift( $parts );
-            $directory = "/" . implode( "/", $parts );
+        array_shift($parts); // Remove "Minnow"
+        $subDir = implode(DIRECTORY_SEPARATOR, $parts);
+        $finalDir = $outputDir . DIRECTORY_SEPARATOR . 'app' . (empty($subDir) ? '' : DIRECTORY_SEPARATOR . $subDir);
+        if (!is_dir($finalDir)) {
+            mkdir($finalDir, 0777, true);
         }
 
-        // Determine the output file path
-        $outputDir = __DIR__ . '/build';
-        if (!is_dir($outputDir)) {
-            mkdir($outputDir, 0777, true);
-        }
-        if (!is_dir("{$outputDir}/app{$directory}/")) {
-            mkdir("{$outputDir}/app{$directory}/", 0777, true);
-        }
-        $outputFile = "{$outputDir}/app{$directory}/{$className}.php";
+        $outputFile = $finalDir . DIRECTORY_SEPARATOR . $className . '.php';
         echo "Generating $outputFile ($namespace)\n";
-
-        // Save the generated code to the file
+        
         file_put_contents($outputFile, $code);
     }
 }
+
 
 // Generate code for each global class
 foreach ($allGlobalClassMethods as $className => $methods) {
@@ -484,14 +643,17 @@ foreach ($allGlobalClassMethods as $className => $methods) {
                 new Node\Stmt\If_(
                     new Node\Expr\Isset_([
                         new Node\Expr\ArrayDimFetch(
+                     
                             new Node\Expr\Variable('GLOBALS', ['name' => 'GLOBALS']),
                             new Node\Expr\Variable('name')
                         )
                     ]),
+                
                     [
                         'stmts' => [
                             new Node\Stmt\Return_(
                                 new Node\Expr\ArrayDimFetch(
+        
                                     new Node\Expr\Variable('GLOBALS', ['name' => 'GLOBALS']),
                                     new Node\Expr\Variable('name')
                                 )
@@ -508,9 +670,9 @@ foreach ($allGlobalClassMethods as $className => $methods) {
     $classNode = new Node\Stmt\Class_($className, [
         'stmts' => $methods,
     ]);
-
-    // This class is not in a namespace
-    $code = $prettyPrinter->prettyPrintFile([$classNode]);
+    // This class should be in a namespace to be PSR-4 compliant
+    $namespaceNode = new Node\Stmt\Namespace_(new Node\Name($className), [$classNode]);
+    $code = $prettyPrinter->prettyPrintFile([$namespaceNode]);
 
     // Determine the output file path
     $outputDir = __DIR__ . '/build';
@@ -518,8 +680,7 @@ foreach ($allGlobalClassMethods as $className => $methods) {
         mkdir($outputDir . '/app', 0777, true);
     }
     $outputFile = $outputDir . '/app/' . $className . '.php';
-    echo "Generating global class $outputFile\n";
-
+    echo "Generating namespaced class $outputFile\n";
     // Save the generated code to the file
     file_put_contents($outputFile, $code);
 }
@@ -529,7 +690,6 @@ $sortableMappings = array_filter($functionMappings, 'is_array');
 $polyfillMappings = array_filter($functionMappings, function($value) {
     return !is_array($value);
 });
-
 // Sort only the array-based mappings
 uasort($sortableMappings, function ($a, $b) {
     // Compare namespaces
@@ -551,7 +711,6 @@ uasort($sortableMappings, function ($a, $b) {
     // Classes are equal, compare methods
     return strcmp($a['method'], $b['method']);
 });
-
 // Combine the sorted mappings with the polyfills
 $functionMappings = $sortableMappings + $polyfillMappings;
 // Write updated function mappings back to mappings.yaml
@@ -563,7 +722,6 @@ $combinedMappings = [
         'classes' => $outdatedClassMappings,
     ],
 ];
-
 // Write updated mappings back to mappings.yaml
 $yaml = Yaml::dump($combinedMappings, 4, 2);
 file_put_contents('mappings.yaml', $yaml);
@@ -577,8 +735,9 @@ foreach ($functionMappings as $functionName => $mapping) {
         continue;
     }
     
-    $namespace = $mapping['namespace'];
-    $class = $mapping['class'] ?? null; // Null for global classes
+    $namespace = str_replace('/', '\\', $mapping['namespace']);
+    $class = $mapping['class'] ?? null;
+    // Null for global classes
     $method = $mapping['method'];
     // Check if the function is a built-in function
     if (in_array(strtolower($functionName), $builtInFunctions)) {
@@ -588,17 +747,19 @@ foreach ($functionMappings as $functionName => $mapping) {
     
     if ($class) {
         // Existing logic for namespaced classes
+        $fqcn = '\\' . $namespace . '\\' . $class;
         $bindingsCode .= <<<EOD
 function {$functionName}(...\$args) {
-    return {$namespace}\\{$class}::{$method}(...\$args);
+    return {$fqcn}::{$method}(...\$args);
 }
 
 EOD;
     } else {
         // New logic for global classes
+        $fqcn = '\\' . $namespace;
         $bindingsCode .= <<<EOD
 function {$functionName}(...\$args) {
-    return {$namespace}::{$method}(...\$args);
+    return {$fqcn}::{$method}(...\$args);
 }
 
 EOD;
@@ -607,10 +768,9 @@ EOD;
 }
 
 foreach ($classMappings as $originalClassName => $mapping) {
-    $namespace = $mapping['namespace'];
+    $namespace = str_replace('/', '\\', $mapping['namespace']);
     $class = $mapping['class'];
-
-    $newClassFullName = "{$namespace}\\{$class}";
+    $newClassFullName = "\\{$namespace}\\{$class}";
     $bindingsCode .= "class_alias('{$newClassFullName}', '{$originalClassName}');\n";
 }
 
